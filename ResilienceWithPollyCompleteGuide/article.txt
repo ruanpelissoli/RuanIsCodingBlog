@@ -1,0 +1,237 @@
+﻿Resilient Applications with Polly - Part 1
+
+As a web developer, we will have to communicate with many other services when developing a web application. When we talk about microservices, 
+those services numbers tend to be a lot bigger.
+With that said, you will eventually try to call a faulted service and your application will throw an exception because the called service is unavailable at that moment.
+
+Ok, so if the service you is trying to call is completely down and you try again, probably you will face the same error. But, there are situations where 
+if you immediately try again you will be able to reach this service successfully.
+This is what we call a transient error:
+
+"Transient faults include the momentary loss of network connectivity to components and services, the temporary unavailability of a service, 
+or timeouts that arise when a service is busy. These faults are often self-correcting, and if the action is repeated after a suitable delay it is likely to succeed."
+ref: https://docs.microsoft.com/en-us/azure/architecture/best-practices/transient-faults
+
+This is where Polly comes in handy.
+Polly is a .NET resilience and transient-fault-handling library, which helps us developer to handle those fault errors gracefully avoiding many headaches and unslept nights.
+We can set up retries, fallbacks, circuit braker, timeouts and rate-limiting with ease.
+ref: https://github.com/App-vNext/Polly
+
+Let's imagine de following scenario:
+Your are developing a web site for a pet shop, in your home page you want to call a api that returns cat facts (why not?) to show to your customers.
+And for whatever reason this call fails and you don't want to let your customers down without their daily cat facts. The first thing you need to do 
+is try again to make sure that this api is not really unavailable.
+Time to write some code:
+
+So I created a new web api projeto in Visual Studio, and we will start with this boilerplate code:
+
+<code>
+    public class CatFactService : ICatFactService
+    {
+        public async Task<string> GetDailyFact()
+        {
+            var httpClient = new HttpClient
+            {
+                BaseAddress = new Uri("https://catfact.ninja/"),
+                DefaultRequestHeaders =
+                {
+                    { "Accept", "application/json" }
+                }
+            };
+
+            var dailyCatFactResponse = await httpClient.GetStringAsync("fact");
+
+            return dailyCatFactResponse;
+        }
+    }
+</code>
+
+However this will work, it is a very poor way to call a service. We are creating a new HttpClient instances every time we ask for 
+a new cat fact and this is not performant and we don't want to do this.
+We always should use IHttpClientFactory interface to call methods, with it we can reuse our client by giving names to them. 
+First of all we need to register the IHttpClientFactory within our Startup class.
+
+<code>
+    public void ConfigureServices(IServiceCollection services)
+    {
+        ...  
+
+        services.AddHttpClient("CatFacts", client =>
+        {
+            client.BaseAddress = new Uri("https://catfact.ninja/");
+            client.DefaultRequestHeaders.Add("Accept", "application/json");
+        });
+
+        ...
+    }
+</code>
+
+We created a named client "CatFacts" that we will use for cat facts calls. Now we can inject IHttpClientFactory in our service and use it to call the cat fact service.
+
+<code>
+    public class CatFactService : ICatFactService
+    {
+        private readonly IHttpClientFactory _httpClientFactory;
+
+        public CatFactService(IHttpClientFactory httpClientFactory)
+        {
+            _httpClientFactory = httpClientFactory;
+        }
+
+        public async Task<string> GetDailyFact()
+        {
+            var httpClient = _httpClientFactory.CreateClient("CatFacts");
+
+            var dailyCatFactResponse = await httpClient.GetStringAsync("fact");
+
+            return dailyCatFactResponse;
+        }
+    }
+</code>
+
+But hey, we are not resilient yet. If the service calls fails, our app will throw an exception.
+Moving on, we need to install two packages into our project:
+
+Polly
+Microsoft.Extensions.Http.Polly
+
+This will give us an extension method to use with our http client service injection.
+
+<code>
+    public void ConfigureServices(IServiceCollection services)
+    {
+        ...
+
+        services.AddHttpClient("CatFacts", client =>
+        {
+            client.BaseAddress = new Uri("https://catfact.ninja/");
+            client.DefaultRequestHeaders.Add("Accept", "application/json");
+        }).AddTransientHttpErrorPolicy(builder =>
+            builder.WaitAndRetryAsync(
+                retryCount: 5, 
+                sleepDurationProvider: _ => TimeSpan.FromMilliseconds(500)));
+
+        ...
+    }
+</code>
+
+We are using the AddTransientHttpErrorPolicy extension method and then configuring the WaitAndRetryAsync method which is from Polly's package.
+Essentially we are telling to our http client to call the api 5 times with 500 milisseconds between each call before throw an exception.
+So if the service had a transient error, the next call might succeed and we won't interrupt our app. Unless, obviously, the service is completely down.
+
+Run your project to look for yourself.
+
+Retry and Fallback Policies
+
+An alternative to add retries tied to http client is using policies.
+With retry policies we can have more flexibily on how we handle errors, configure fallbacks and run code between each retry attemp.
+Let's go back to CatFactService and add some code:
+
+<code>
+    ...
+
+    private readonly IAsyncPolicy _retryAndFallbackPolicy;
+
+    private const int MaxRetriesAttempts = 5;
+
+    public CatFactService(IHttpClientFactory httpClientFactory)
+    {
+        _httpClientFactory = httpClientFactory;
+
+        var retryPolicy = Policy.Handle<HttpRequestException>()
+            .WaitAndRetryAsync(
+                retryCount: MaxRetriesAttempts,
+                sleepDurationProvider: times => TimeSpan.FromMilliseconds(times * 300),
+                onRetry: (ex, span, retryCount, ctx) =>
+                {
+                    Console.WriteLine($"Retrying for the {retryCount} time");
+                });
+
+        var fallbackPolicy = Policy.Handle<HttpRequestException>()
+            .FallbackAsync(async cancelationToken =>
+            {
+                Console.WriteLine($"Policy fallback reached. Service is down for good.");
+
+                await Task.Run(() => Console.WriteLine($"Maybe send to a dead letter queue."), cancelationToken);
+            });
+
+        _retryAndFallbackPolicy = Policy.WrapAsync(retryPolicy, fallbackPolicy);
+    }
+    ...
+</code>
+
+Calm down, let's digest this piece of code bit by bit:
+
+We're injection an IAsyncPolicy instance to our service.
+
+<code>
+    ...
+
+    var retryPolicy = Policy.Handle<HttpRequestException>()
+        .WaitAndRetryAsync(
+            retryCount: MaxRetriesAttempts,
+            sleepDurationProvider: times => TimeSpan.FromMilliseconds(times * 300),
+            onRetry: (ex, span, retryCount, ctx) =>
+            {
+                Console.WriteLine($"Retrying for the {retryCount} time");
+            });
+
+    ...
+</code>
+
+In this code snippet we are creating a new retry policy very similar to what we did with IHttpClient.
+We create a handle for this policy passing an HttpRequestException, which means that this policy will only retry for HttpRequestException that are thrown.
+It can be more generic with an Exception class for example, means that will retry for every kind of exception.
+We are passing three parameters to WaitAndRetryAsync method:
+
+- retryCount: max retry attempts
+- sleepDurationProvider: the time between each call (note that we are doing it exponentially)
+- onRetry: a piece of code that will execute between each retry.
+
+<code>
+    ...
+
+    var fallbackPolicy = Policy.Handle<HttpRequestException>()
+        .FallbackAsync(async cancelationToken =>
+        {
+            Console.WriteLine($"Policy fallback reached. Service is down for good.");
+
+            await Task.Run(() => Console.WriteLine($"Maybe send to a dead letter queue."), cancelationToken);
+        });
+
+    _retryAndFallbackPolicy = Policy.WrapAsync(fallbackPolicy, retryPolicy);
+
+    ...
+</code>
+
+Here we are creating a fallback policy, which means that if after all the attempts the service still couldn't be called, this code will run.
+It is a good place to place logs and calls to another pieces of your code if necessary.
+
+And then we are wrapping the retry policy and fallback policy into one single policy that we can use to execute any task we want.
+
+<code>
+    public async Task<string> GetDailyFact()
+    {
+        var httpClient = _httpClientFactory.CreateClient("CatFacts");
+
+        string dailyCatFactResponse = string.Empty;
+
+        var random = new Random();
+
+        await _retryAndFallbackPolicy.ExecuteAsync(async () =>
+        {
+            if(random.Next(1, 3) == 1)                
+                throw new HttpRequestException();
+
+            dailyCatFactResponse = await httpClient.GetStringAsync("fact");
+        });
+
+        return dailyCatFactResponse;
+    }
+</code:
+
+We are finally using the retry and fallback policy to wrap the api call.
+I'm using a random number to simulate a possible transient error to trigger our resilience just for example sake.
+
+Run the project and play with the max retry value and the odds of throwing an exception. 
+Place breakpoint into onRetry and fallback methods.
